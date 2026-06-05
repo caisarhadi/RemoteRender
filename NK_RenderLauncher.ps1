@@ -347,7 +347,7 @@ $y += 152
 # ============================================================
 # UI LAYOUT - Sequences
 # ============================================================
-New-SectionHeader -Text "SEQUENCES" -Y $y -Parent $form | Out-Null
+$lblSeq = New-SectionHeader -Text "SEQUENCES" -Y $y -Parent $form
 $btnSeqAll  = New-SmallButton -Text "All"  -X 485 -Y $y -Parent $form
 $btnSeqNone = New-SmallButton -Text "None" -X 540 -Y $y -Parent $form
 $y += 24
@@ -379,7 +379,7 @@ $y += 152
 # ============================================================
 # UI LAYOUT - Passes
 # ============================================================
-New-SectionHeader -Text "PASSES (Job Index)" -Y $y -Parent $form | Out-Null
+$lblPass = New-SectionHeader -Text "PASSES (Job Index)" -Y $y -Parent $form
 $btnPassAll  = New-SmallButton -Text "All"  -X 485 -Y $y -Parent $form
 $btnPassNone = New-SmallButton -Text "None" -X 540 -Y $y -Parent $form
 $y += 24
@@ -412,7 +412,7 @@ $y += 48
 # ============================================================
 # UI LAYOUT - Render Settings
 # ============================================================
-New-SectionHeader -Text "RENDER SETTINGS" -Y $y -Parent $form | Out-Null
+$lblSettings = New-SectionHeader -Text "RENDER SETTINGS" -Y $y -Parent $form
 $y += 24
 
 $settingsPanel = New-Object System.Windows.Forms.Panel
@@ -451,7 +451,7 @@ $y += 24
 $cbRevert = New-StyledCheckBox -Text "Revert uncommitted local changes before update (Warning: Destructive)" -Font $fontSmall -ForeColor $cTextDim -BackColor $cBack -X 20 -Y $y -Checked $false -Parent $form
 $y += 30
 
-New-StyledLabel -Text "TARGET PC:" -Font $fontSmall -ForeColor $cTextDim -X 20 -Y ($y + 2) -W 100 -H 18 -Parent $form | Out-Null
+$lblTarget = New-StyledLabel -Text "TARGET PC:" -Font $fontSmall -ForeColor $cTextDim -X 20 -Y ($y + 2) -W 100 -H 18 -Parent $form
 $cmbTarget = New-StyledComboBox -Items @("Local (This PC)", "PC 002", "PC 003", "PC 004") -X 125 -Y $y -W 455 -Parent $form
 $y += 40
 
@@ -496,6 +496,10 @@ $btnLaunch.Location = New-Object System.Drawing.Point(210, $y)
 $btnLaunch.Cursor = [System.Windows.Forms.Cursors]::Hand
 $form.Controls.Add($btnLaunch)
 
+# Store original positions for Dispatch Mode restore
+$origStatusLocation = $lblStatus.Location
+$origOpenFolderLocation = $btnOpenFolder.Location
+
 # ============================================================
 # LISTENER TIMER
 # ============================================================
@@ -507,10 +511,36 @@ $timer.Interval = 30000 # 30 seconds
 # All event wiring is grouped here, after every control exists.
 # ============================================================
 
+# --- UI Mode Toggle ---
+# Controls that are only visible in Dispatch Mode (hidden during Listen Mode)
+$dispatchControls = @(
+    $lblSeq, $btnSeqAll, $btnSeqNone, $seqPanel,
+    $lblPass, $btnPassAll, $btnPassNone, $passPanel,
+    $lblSettings, $settingsPanel,
+    $cbSync, $cbRevert, $lblTarget, $cmbTarget,
+    $btnLaunch
+)
+
+function Update-UIMode {
+    $isListening = $cbListen.Checked
+    foreach ($ctrl in $dispatchControls) { $ctrl.Visible = -not $isListening }
+
+    if ($isListening) {
+        $form.Size = New-Object System.Drawing.Size(620, 350)
+        $lblStatus.Location = New-Object System.Drawing.Point(20, 225)
+        $btnOpenFolder.Location = New-Object System.Drawing.Point(220, 250)
+    } else {
+        $form.Size = New-Object System.Drawing.Size(620, 950)
+        $lblStatus.Location = $origStatusLocation
+        $btnOpenFolder.Location = $origOpenFolderLocation
+    }
+}
+
 # --- Form Events ---
 $form.Add_Shown({
     $mode = 1
     [DwmHelper]::DwmSetWindowAttribute($form.Handle, 20, [ref]$mode, 4) | Out-Null
+    Update-UIMode
     $form.Refresh()
     # Auto-start timer if Listen Mode was saved as enabled
     if ($cbListen.Checked -and $global:CachedIdentity -ne "Local (This PC)") {
@@ -543,6 +573,7 @@ $cmbIdentity.Add_SelectedIndexChanged({
 # --- Listen Mode toggle ---
 $cbListen.Add_CheckedChanged({
     Save-RenderConfig
+    Update-UIMode
     if ($cbListen.Checked -and $cmbIdentity.SelectedItem.ToString() -ne "Local (This PC)") {
         $timer.Start()
         $lblStatus.Text = "Listening Mode enabled. Polling every 30s..."
@@ -677,24 +708,25 @@ $timer.Add_Tick({
         $projectVal = $txtProject.Text
         $engineVal = $txtEngine.Text
 
+        # Parse passes from job data
+        $passList = "ALL"
+        if ($jobData.JobIndicesArg -and $jobData.JobIndicesArg -match '-JobIndices=(.+)') {
+            $indices = $Matches[1].Split(',')
+            $passList = ($indices | ForEach-Object { "Pass $_" }) -join ", "
+        }
+
         # Claim job immediately: remove from Plastic SCM before rendering.
         # This prevents re-execution if this PC crashes or another PC picks it up.
-        $lblStatus.Text = "Listening Mode: Claiming job $($jobData.SequenceName)..."
+        $lblStatus.Text = "Listening Mode: Claiming job $($jobData.SequenceName) [$passList]..."
         $form.Refresh()
         Push-Location -Path $ScriptDir
         try {
             & "cm" remove "$jobFile"
-            & "cm" checkin "$jobsDir" -m "Claimed render job for $($jobData.SequenceName)"
+            & "cm" checkin "$jobsDir" -m "[$identity] Claimed render job for $($jobData.SequenceName) [$passList]"
         } catch {}
         Pop-Location
 
-        # Sync the heavy Unreal project before rendering
-        $projDir = Split-Path -Parent $projectVal
-        Push-Location -Path $projDir
-        try { & "cm" update } catch {}
-        Pop-Location
-
-        $lblStatus.Text = "Listening Mode: Executing remote job $($jobData.SequenceName)..."
+        $lblStatus.Text = "Listening Mode: Executing remote job $($jobData.SequenceName) [$passList]..."
         $form.Refresh()
 
         $cmdArgs = "`"$projectVal`" $($jobData.BaseArgs) -ExecutePythonScript=`"$PythonScript`" -Queue=`"$($jobData.Queue)`" $($jobData.OverrideArgs) $($jobData.JobIndicesArg)"
