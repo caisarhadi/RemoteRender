@@ -1,5 +1,5 @@
 @echo off
-REM Complete Batch Render Script for Noah Kahan Project
+REM Complete Batch Render Script
 REM This script will render multiple queues sequentially.
 
 if exist "RenderConfig.bat" (
@@ -8,7 +8,7 @@ if exist "RenderConfig.bat" (
 )
 
 set ENGINE="C:\Program Files\Epic Games\UE_5.7\Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
-set PROJECT="D:\Cloud Repositories-NK26\NK2026\NK2026.uproject"
+set PROJECT="D:\Project\MyProject.uproject"
 
 :PROMPT_CONFIG
 echo =========================================================

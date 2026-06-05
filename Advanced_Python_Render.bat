@@ -1,5 +1,5 @@
 @echo off
-REM Advanced Python Batch Render Script for Noah Kahan Project
+REM Advanced Python Batch Render Script
 REM Uses a Python Executor to filter passes and inject MRG overrides dynamically.
 
 if exist "RenderConfig.bat" (
@@ -8,7 +8,7 @@ if exist "RenderConfig.bat" (
 )
 
 set ENGINE="C:\Program Files\Epic Games\UE_5.7\Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
-set PROJECT="D:\Cloud Repositories-NK26\NK2026\NK2026.uproject"
+set PROJECT="D:\Project\MyProject.uproject"
 
 :PROMPT_CONFIG
 echo =========================================================
@@ -100,7 +100,7 @@ echo.
 echo =========================================================
 echo RENDER OVERRIDES (Press Enter to keep preset defaults)
 echo =========================================================
-set /p PASS_FILTER="Pass Filter (e.g. Song, Env, LightPass) [Leave blank for ALL]: "
+set /p JOB_INDICES="Job Indices (e.g. 1,3,4 for Pass 1,3,4) [Leave blank for ALL]: "
 
 echo.
 echo Resolution Options:
@@ -127,7 +127,7 @@ set /p WARMUP="Warm Up Frames [Leave blank for Preset Default]: "
 
 REM Build the Python Override String
 set PY_ARGS=-RenderResX="%RESX%" -RenderResY="%RESY%"
-if not "%PASS_FILTER%"=="" set PY_ARGS=%PY_ARGS% -PassFilter="%PASS_FILTER%"
+if not "%JOB_INDICES%"=="" set PY_ARGS=%PY_ARGS% -JobIndices="%JOB_INDICES%"
 if not "%SPATIAL%"=="" set PY_ARGS=%PY_ARGS% -Spatial="%SPATIAL%"
 if not "%TEMPORAL%"=="" set PY_ARGS=%PY_ARGS% -Temporal="%TEMPORAL%"
 if not "%WARMUP%"=="" set PY_ARGS=%PY_ARGS% -WarmUp="%WARMUP%"

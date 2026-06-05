@@ -1,5 +1,5 @@
 # ============================================================
-# NK Movie Render Launcher - PowerShell GUI
+# MRQ Render Launcher - PowerShell GUI
 # ============================================================
 # This script creates a modern dark-themed Windows Forms GUI 
 # for launching Unreal Engine Movie Render Queue renders.
@@ -26,10 +26,11 @@ public class DwmHelper {
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ConfigFile = Join-Path $ScriptDir "RenderConfig.bat"
 $PythonScript = Join-Path $ScriptDir "MRQ_Python_Executor.py"
+$CancelMarker = Join-Path $ScriptDir "render_cancelled.marker"
 
 # Default paths (will be overridden by RenderConfig.bat if it exists)
 $EnginePath = "C:\Program Files\Epic Games\UE_5.7\Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
-$ProjectPath = "D:\Cloud Repositories-NK26\NK2026\NK2026.uproject"
+$ProjectPath = "D:\Project\MyProject.uproject"
 
 # Read existing config
 if (Test-Path $ConfigFile) {
@@ -52,7 +53,9 @@ $Sequences = @(
     @{ Code="0210"; Name="Orange Juice";     Queue="/Game/NOAH_KAHAN/NK_Sequencer_MRQ_Presets/Render_Queue/NK_RenderQueue_0210_OrangeJuice.NK_RenderQueue_0210_OrangeJuice" }
 )
 
-$Passes = @("Song", "Env", "House", "House_Back", "LightPass")
+# Number of job slots (passes) per queue. Each queue is assumed to have
+# jobs in the same order. The GUI shows numbered checkboxes (Pass 1..N).
+$PassCount = 5
 
 # ============================================================
 # COLOR PALETTE - Dark Greyscale
@@ -75,11 +78,21 @@ $fontSmall   = New-Object System.Drawing.Font("Segoe UI", 8.5)
 $fontBtn     = New-Object System.Drawing.Font("Segoe UI Semibold", 11)
 
 # ============================================================
+# Ctrl+A handler for TextBoxes (WinForms does not support this natively)
+# ============================================================
+$ctrlAHandler = {
+    if ($_.Control -and $_.KeyCode -eq 'A') {
+        $this.SelectAll()
+        $_.SuppressKeyPress = $true
+    }
+}
+
+# ============================================================
 # MAIN FORM
 # ============================================================
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "NK Movie Render Launcher"
-$form.Size = New-Object System.Drawing.Size(620, 780)
+$form.Text = "MRQ Render Launcher"
+$form.Size = New-Object System.Drawing.Size(620, 820)
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $cBack
 $form.ForeColor = $cText
@@ -100,7 +113,7 @@ $y = 15
 # TITLE
 # ============================================================
 $lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = "NK Movie Render Launcher"
+$lblTitle.Text = "MRQ Render Launcher"
 $lblTitle.Font = $fontTitle
 $lblTitle.ForeColor = $cText
 $lblTitle.Location = New-Object System.Drawing.Point(20, $y)
@@ -143,6 +156,7 @@ $txtEngine.BorderStyle = 'FixedSingle'
 $txtEngine.Location = New-Object System.Drawing.Point(70, 8)
 $txtEngine.Size = New-Object System.Drawing.Size(480, 22)
 $txtEngine.Text = $EnginePath
+$txtEngine.Add_KeyDown($ctrlAHandler)
 $configPanel.Controls.Add($txtEngine)
 
 $lblProject = New-Object System.Windows.Forms.Label
@@ -161,6 +175,7 @@ $txtProject.BorderStyle = 'FixedSingle'
 $txtProject.Location = New-Object System.Drawing.Point(70, 40)
 $txtProject.Size = New-Object System.Drawing.Size(480, 22)
 $txtProject.Text = $ProjectPath
+$txtProject.Add_KeyDown($ctrlAHandler)
 $configPanel.Controls.Add($txtProject)
 
 # Sync Checkbox
@@ -253,10 +268,10 @@ $btnSeqNone.Add_Click({ foreach ($cb in $seqCheckboxes) { $cb.Checked = $false }
 $y += 152
 
 # ============================================================
-# PASSES SECTION
+# PASSES SECTION (index-based: Pass 1, Pass 2, ...)
 # ============================================================
 $lblPass = New-Object System.Windows.Forms.Label
-$lblPass.Text = "PASSES"
+$lblPass.Text = "PASSES (Job Index)"
 $lblPass.Font = $fontSection
 $lblPass.ForeColor = $cSection
 $lblPass.Location = New-Object System.Drawing.Point(20, $y)
@@ -297,16 +312,16 @@ $form.Controls.Add($passPanel)
 
 $passCheckboxes = @()
 $px = 12
-foreach ($pass in $Passes) {
+for ($i = 1; $i -le $PassCount; $i++) {
     $cb = New-Object System.Windows.Forms.CheckBox
-    $cb.Text = "  $pass"
+    $cb.Text = "  Pass $i"
     $cb.Font = $fontBody
     $cb.ForeColor = $cText
     $cb.BackColor = $cSurface
     $cb.Location = New-Object System.Drawing.Point($px, 9)
     $cb.AutoSize = $true
     $cb.Checked = $false
-    $cb.Tag = $pass
+    $cb.Tag = $i  # Store the 1-based index
     $passPanel.Controls.Add($cb)
     $passCheckboxes += $cb
     $px += 108
@@ -332,7 +347,7 @@ $y += 24
 
 $settingsPanel = New-Object System.Windows.Forms.Panel
 $settingsPanel.Location = New-Object System.Drawing.Point(20, $y)
-$settingsPanel.Size = New-Object System.Drawing.Size(560, 165)
+$settingsPanel.Size = New-Object System.Drawing.Size(560, 190)
 $settingsPanel.BackColor = $cSurface
 $form.Controls.Add($settingsPanel)
 
@@ -378,6 +393,7 @@ $txtSpatial.BorderStyle = 'FixedSingle'
 $txtSpatial.Location = New-Object System.Drawing.Point(150, 48)
 $txtSpatial.Size = New-Object System.Drawing.Size(80, 22)
 $txtSpatial.Text = "1"
+$txtSpatial.Add_KeyDown($ctrlAHandler)
 $settingsPanel.Controls.Add($txtSpatial)
 
 $lblSpatialHint = New-Object System.Windows.Forms.Label
@@ -405,6 +421,7 @@ $txtTemporal.BorderStyle = 'FixedSingle'
 $txtTemporal.Location = New-Object System.Drawing.Point(150, 83)
 $txtTemporal.Size = New-Object System.Drawing.Size(80, 22)
 $txtTemporal.Text = "1"
+$txtTemporal.Add_KeyDown($ctrlAHandler)
 $settingsPanel.Controls.Add($txtTemporal)
 
 $lblTemporalHint = New-Object System.Windows.Forms.Label
@@ -432,6 +449,7 @@ $txtWarmup.BorderStyle = 'FixedSingle'
 $txtWarmup.Location = New-Object System.Drawing.Point(150, 118)
 $txtWarmup.Size = New-Object System.Drawing.Size(80, 22)
 $txtWarmup.Text = "32"
+$txtWarmup.Add_KeyDown($ctrlAHandler)
 $settingsPanel.Controls.Add($txtWarmup)
 
 $lblWarmupHint = New-Object System.Windows.Forms.Label
@@ -442,7 +460,18 @@ $lblWarmupHint.Location = New-Object System.Drawing.Point(240, 120)
 $lblWarmupHint.Size = New-Object System.Drawing.Size(200, 18)
 $settingsPanel.Controls.Add($lblWarmupHint)
 
-$y += 175
+# No Sound checkbox
+$cbNoSound = New-Object System.Windows.Forms.CheckBox
+$cbNoSound.Text = "  No Sound  (disable audio - required for silent headless renders, disables WAV export)"
+$cbNoSound.Font = $fontSmall
+$cbNoSound.ForeColor = $cText
+$cbNoSound.BackColor = $cSurface
+$cbNoSound.Location = New-Object System.Drawing.Point(12, 155)
+$cbNoSound.AutoSize = $true
+$cbNoSound.Checked = $true
+$settingsPanel.Controls.Add($cbNoSound)
+
+$y += 200
 
 # ============================================================
 # BOTTOM BUTTONS
@@ -531,8 +560,11 @@ $btnLaunch.Add_Click({
         2 { $resX = "2484"; $resY = "648" }
     }
 
-    # Build base args (editor mode, PIEExecutor requires this)
-    $baseArgs = "-log -notexturestreaming -unattended -nosound"
+    # Build base args
+    $baseArgs = "-log -notexturestreaming -unattended"
+    if ($cbNoSound.Checked) {
+        $baseArgs += " -nosound"
+    }
     
     # Build override args
     $overrideArgs = "-RenderResX=$resX -RenderResY=$resY"
@@ -540,19 +572,25 @@ $btnLaunch.Add_Click({
     if ($txtTemporal.Text.Trim() -ne "") { $overrideArgs += " -Temporal=$($txtTemporal.Text.Trim())" }
     if ($txtWarmup.Text.Trim() -ne "") { $overrideArgs += " -WarmUp=$($txtWarmup.Text.Trim())" }
 
-    # Build pass filter (only if not ALL passes are selected)
+    # Build job indices filter (only if not ALL passes are selected)
     $allPassesSelected = ($selectedPasses.Count -eq $passCheckboxes.Count)
-
-    # Count total render tasks
-    $totalTasks = 0
-    foreach ($seqCb in $selectedSeqs) {
-        if ($allPassesSelected) { $totalTasks++ }
-        else { $totalTasks += $selectedPasses.Count }
+    $jobIndicesArg = ""
+    if (-not $allPassesSelected) {
+        $indices = ($selectedPasses | ForEach-Object { $_.Tag }) -join ","
+        $jobIndicesArg = "-JobIndices=$indices"
     }
+
+    # Count totals: one Unreal launch per sequence, total jobs = sequences x passes
+    $totalSeqs = $selectedSeqs.Count
+    $totalJobs = $selectedSeqs.Count * $selectedPasses.Count
 
     # Log what we're about to do
     $seqList = ($selectedSeqs | ForEach-Object { $_.Tag.Code }) -join ", "
-    $passList = if ($allPassesSelected) { "ALL" } else { ($selectedPasses | ForEach-Object { $_.Tag }) -join ", " }
+    $passList = if ($allPassesSelected) { "ALL" } else { ($selectedPasses | ForEach-Object { "Pass $($_.Tag)" }) -join ", " }
+
+    # Clean up any stale cancel marker
+    if (Test-Path $CancelMarker) { Remove-Item $CancelMarker -Force }
+
     # Sync Plastic SCM
     if ($cbSync.Checked) {
         $lblStatus.Text = "Syncing latest changes from Plastic SCM..."
@@ -575,44 +613,47 @@ $btnLaunch.Add_Click({
         Pop-Location
     }
 
-    $lblStatus.Text = "Starting $totalTasks task(s): Seq[$seqList] Pass[$passList] @ ${resX}x${resY}"
+    $lblStatus.Text = "Starting $totalSeqs sequence(s), $totalJobs total job(s): Seq[$seqList] Pass[$passList] @ ${resX}x${resY}"
     $form.Refresh()
 
-    # Minimize the form
-    $form.WindowState = 'Minimized'
-
+    $cancelled = $false
     $taskNum = 0
     foreach ($seqCb in $selectedSeqs) {
+        if ($cancelled) { break }
+
         $seq = $seqCb.Tag
         $queue = $seq.Queue
 
-        if ($allPassesSelected) {
-            # Render all passes at once (no filter)
-            $taskNum++
-            $lblStatus.Text = "Rendering $taskNum / $totalTasks : $($seq.Name) - ALL passes..."
-            $form.Refresh()
+        $taskNum++
+        $jobsDone = ($taskNum - 1) * $selectedPasses.Count
+        $jobsInThis = $selectedPasses.Count
+        $lblStatus.Text = "Sequence $taskNum / $totalSeqs : $($seq.Name) - $passList ($jobsDone of $totalJobs jobs done)..."
+        $form.Refresh()
 
-            $cmdArgs = "`"$projectVal`" $baseArgs -ExecutePythonScript=`"$PythonScript`" -Queue=`"$queue`" $overrideArgs"
-            $process = Start-Process -FilePath $engineVal -ArgumentList $cmdArgs -Wait -PassThru
+        $cmdArgs = "`"$projectVal`" $baseArgs -ExecutePythonScript=`"$PythonScript`" -Queue=`"$queue`" $overrideArgs $jobIndicesArg"
+        $process = Start-Process -FilePath $engineVal -ArgumentList $cmdArgs -PassThru
+
+        # Non-blocking wait: keep the GUI responsive via DoEvents()
+        while (-not $process.HasExited) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 500
         }
-        else {
-            # Render each selected pass individually
-            foreach ($passCb in $selectedPasses) {
-                $passName = $passCb.Tag
-                $taskNum++
-                $lblStatus.Text = "Rendering $taskNum / $totalTasks : $($seq.Name) - $passName..."
-                $form.Refresh()
 
-                $passArg = "-PassFilter=$passName"
-                $cmdArgs = "`"$projectVal`" $baseArgs -ExecutePythonScript=`"$PythonScript`" -Queue=`"$queue`" $overrideArgs $passArg"
-                $process = Start-Process -FilePath $engineVal -ArgumentList $cmdArgs -Wait -PassThru
-            }
+        # Check for cancel marker written by the Python script
+        if (Test-Path $CancelMarker) {
+            Remove-Item $CancelMarker -Force
+            $cancelled = $true
+            $jobsCancelled = ($taskNum - 1) * $selectedPasses.Count + $selectedPasses.Count
+            $lblStatus.Text = "Render cancelled by user. Stopped after sequence $taskNum / $totalSeqs ($jobsCancelled of $totalJobs jobs)."
+            $form.Refresh()
+            break
         }
     }
 
     # Done
-    $form.WindowState = 'Normal'
-    $lblStatus.Text = "Completed $totalTasks render task(s)."
+    if (-not $cancelled) {
+        $lblStatus.Text = "Completed all $totalSeqs sequence(s), $totalJobs job(s)."
+    }
 })
 
 # ============================================================
