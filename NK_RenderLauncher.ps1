@@ -1,10 +1,10 @@
 # ============================================================
 # MRQ Render Launcher - PowerShell GUI
 # ============================================================
-# This script creates a modern dark-themed Windows Forms GUI 
-# for launching Unreal Engine Movie Render Queue renders.
-# It reads RenderConfig.bat for engine/project paths and 
-# calls MRQ_Python_Executor.py via UnrealEditor-Cmd.exe.
+# Dark-themed Windows Forms GUI for launching Unreal Engine
+# Movie Render Queue renders locally or on remote PCs via
+# Plastic SCM job dispatch. Supports listening mode for
+# remote PCs to auto-pick up and execute render jobs.
 # ============================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -31,6 +31,8 @@ $CancelMarker = Join-Path $ScriptDir "render_cancelled.marker"
 # Default paths (will be overridden by RenderConfig.bat if it exists)
 $EnginePath = "C:\Program Files\Epic Games\UE_5.7\Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
 $ProjectPath = "D:\Project\MyProject.uproject"
+$MyIdentity = "Local (This PC)"
+$MyListen = $false
 
 # Read existing config
 if (Test-Path $ConfigFile) {
@@ -38,6 +40,8 @@ if (Test-Path $ConfigFile) {
     foreach ($line in $configContent) {
         if ($line -match 'set ENGINE=(.+)') { $EnginePath = $Matches[1].Trim('"') }
         if ($line -match 'set PROJECT=(.+)') { $ProjectPath = $Matches[1].Trim('"') }
+        if ($line -match 'set IDENTITY=(.+)') { $MyIdentity = $Matches[1].Trim('"') }
+        if ($line -match 'set LISTEN=(.+)') { $MyListen = $Matches[1].Trim('"') -eq 'TRUE' }
     }
 }
 
@@ -78,8 +82,10 @@ $fontSmall   = New-Object System.Drawing.Font("Segoe UI", 8.5)
 $fontBtn     = New-Object System.Drawing.Font("Segoe UI Semibold", 11)
 
 # ============================================================
-# Ctrl+A handler for TextBoxes (WinForms does not support this natively)
+# UI HELPER FUNCTIONS
 # ============================================================
+
+# Ctrl+A handler for TextBoxes (WinForms does not support this natively)
 $ctrlAHandler = {
     if ($_.Control -and $_.KeyCode -eq 'A') {
         $this.SelectAll()
@@ -87,12 +93,215 @@ $ctrlAHandler = {
     }
 }
 
+function New-StyledLabel {
+    param($Text, $Font, $ForeColor, $X, $Y, $W, $H, $Parent)
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Text
+    $lbl.Font = $Font
+    $lbl.ForeColor = $ForeColor
+    $lbl.Location = New-Object System.Drawing.Point($X, $Y)
+    $lbl.Size = New-Object System.Drawing.Size($W, $H)
+    $Parent.Controls.Add($lbl)
+    return $lbl
+}
+
+function New-StyledTextBox {
+    param($Text, $Font, $X, $Y, $W, $Parent)
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Text = $Text
+    $txt.Font = $Font
+    $txt.BackColor = $cPanel
+    $txt.ForeColor = $cText
+    $txt.BorderStyle = 'FixedSingle'
+    $txt.Location = New-Object System.Drawing.Point($X, $Y)
+    $txt.Size = New-Object System.Drawing.Size($W, 22)
+    $txt.Add_KeyDown($ctrlAHandler)
+    $Parent.Controls.Add($txt)
+    return $txt
+}
+
+function New-StyledComboBox {
+    param($Items, $X, $Y, $W, $Parent)
+    $cmb = New-Object System.Windows.Forms.ComboBox
+    $cmb.Font = $fontBody
+    $cmb.BackColor = $cPanel
+    $cmb.ForeColor = $cText
+    $cmb.FlatStyle = 'Flat'
+    $cmb.DropDownStyle = 'DropDownList'
+    $cmb.Location = New-Object System.Drawing.Point($X, $Y)
+    $cmb.Size = New-Object System.Drawing.Size($W, 24)
+    foreach ($item in $Items) { [void]$cmb.Items.Add($item) }
+    $cmb.SelectedIndex = 0
+    $Parent.Controls.Add($cmb)
+    return $cmb
+}
+
+function New-StyledCheckBox {
+    param($Text, $Font, $ForeColor, $BackColor, $X, $Y, $Checked, $Parent)
+    $cb = New-Object System.Windows.Forms.CheckBox
+    $cb.Text = $Text
+    $cb.Font = $Font
+    $cb.ForeColor = $ForeColor
+    $cb.BackColor = $BackColor
+    $cb.Location = New-Object System.Drawing.Point($X, $Y)
+    $cb.AutoSize = $true
+    $cb.Checked = $Checked
+    $Parent.Controls.Add($cb)
+    return $cb
+}
+
+function New-SmallButton {
+    param($Text, $X, $Y, $Parent)
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text = $Text
+    $btn.Font = $fontSmall
+    $btn.FlatStyle = 'Flat'
+    $btn.FlatAppearance.BorderSize = 1
+    $btn.FlatAppearance.BorderColor = $cBorder
+    $btn.BackColor = $cBtnBg
+    $btn.ForeColor = $cTextDim
+    $btn.Size = New-Object System.Drawing.Size(50, 22)
+    $btn.Location = New-Object System.Drawing.Point($X, $Y)
+    $Parent.Controls.Add($btn)
+    return $btn
+}
+
+function New-SectionHeader {
+    param($Text, $Y, $Parent)
+    return (New-StyledLabel -Text $Text -Font $fontSection -ForeColor $cSection -X 20 -Y $Y -W 300 -H 20 -Parent $Parent)
+}
+
+# ============================================================
+# SHARED FUNCTIONS
+# ============================================================
+
+function Save-RenderConfig {
+    "set ENGINE=`"$($txtEngine.Text)`"" | Out-File -FilePath $ConfigFile -Encoding ascii
+    "set PROJECT=`"$($txtProject.Text)`"" | Out-File -FilePath $ConfigFile -Encoding ascii -Append
+    "set IDENTITY=`"$($global:CachedIdentity)`"" | Out-File -FilePath $ConfigFile -Encoding ascii -Append
+    $listenVal = if ($cbListen.Checked) { 'TRUE' } else { 'FALSE' }
+    "set LISTEN=`"$listenVal`"" | Out-File -FilePath $ConfigFile -Encoding ascii -Append
+}
+
+function Sync-PlasticSCM {
+    param($ProjectPath, $ShouldRevert)
+    $lblStatus.Text = "Syncing latest changes from Plastic SCM..."
+    $form.Refresh()
+
+    $projDir = Split-Path -Parent $ProjectPath
+    Push-Location -Path $projDir
+    try {
+        if ($ShouldRevert) {
+            $lblStatus.Text = "Reverting local changes in Plastic SCM..."
+            $form.Refresh()
+            & "cm" undo "$ScriptDir" -R
+        }
+        $lblStatus.Text = "Syncing latest changes from Plastic SCM..."
+        $form.Refresh()
+        & "cm" update
+    } catch {
+        Write-Host "Plastic SCM sync failed or 'cm' not found. Continuing..."
+    }
+    Pop-Location
+}
+
+function Submit-RemoteJobs {
+    param($TargetName, $SelectedSeqs, $BaseArgs, $OverrideArgs, $JobIndicesArg)
+    $jobsDir = Join-Path $ScriptDir "Jobs"
+    if (-not (Test-Path $jobsDir)) { New-Item -ItemType Directory -Force -Path $jobsDir | Out-Null }
+
+    $lblStatus.Text = "Generating jobs for $TargetName..."
+    $form.Refresh()
+
+    foreach ($seqCb in $SelectedSeqs) {
+        $seq = $seqCb.Tag
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmssfff"
+        $jobFile = Join-Path $jobsDir "${TargetName}_$($seq.Code)_${timestamp}.json"
+
+        $jobObj = @{
+            TargetMachine = $TargetName
+            SequenceCode = $seq.Code
+            SequenceName = $seq.Name
+            Queue = $seq.Queue
+            BaseArgs = $BaseArgs
+            OverrideArgs = $OverrideArgs
+            JobIndicesArg = $JobIndicesArg
+            SubmittedAt = (Get-Date -Format "o")
+        }
+        $jobObj | ConvertTo-Json | Out-File -FilePath $jobFile -Encoding UTF8
+    }
+
+    $lblStatus.Text = "Pushing jobs to Plastic SCM..."
+    $form.Refresh()
+
+    Push-Location -Path $ScriptDir
+    try {
+        & "cm" add "$jobsDir" -R 2>$null
+        & "cm" checkin "$jobsDir" -m "Submitting render jobs to $TargetName"
+        $lblStatus.Text = "Successfully queued $($SelectedSeqs.Count) sequence(s) to $TargetName."
+    } catch {
+        $lblStatus.Text = "Failed to push jobs to Plastic SCM."
+    }
+    Pop-Location
+}
+
+function Invoke-LocalRender {
+    param($SelectedSeqs, $SelectedPasses, $EnginePath, $ProjectPath, $BaseArgs, $OverrideArgs, $JobIndicesArg, $PassList)
+
+    $totalSeqs = $SelectedSeqs.Count
+    $totalJobs = $SelectedSeqs.Count * $SelectedPasses.Count
+    $cancelled = $false
+    $taskNum = 0
+
+    foreach ($seqCb in $SelectedSeqs) {
+        if ($cancelled -or $global:FormClosing) { break }
+
+        $seq = $seqCb.Tag
+        $taskNum++
+        $jobsDone = ($taskNum - 1) * $SelectedPasses.Count
+        $lblStatus.Text = "Sequence $taskNum / $totalSeqs : $($seq.Name) - $PassList ($jobsDone of $totalJobs jobs done)..."
+        $form.Refresh()
+
+        $cmdArgs = "`"$ProjectPath`" $BaseArgs -ExecutePythonScript=`"$PythonScript`" -Queue=`"$($seq.Queue)`" $OverrideArgs $JobIndicesArg"
+        $process = Start-Process -FilePath $EnginePath -ArgumentList $cmdArgs -PassThru
+
+        # Non-blocking wait: keep the GUI responsive via DoEvents()
+        while (-not $process.HasExited) {
+            [System.Windows.Forms.Application]::DoEvents()
+            if ($global:FormClosing) { break }
+            $lblStatus.Text = "Waiting for UnrealEditor-Cmd.exe (PID: $($process.Id)) to fully close in the background..."
+            Start-Sleep -Milliseconds 500
+        }
+
+        # Check for cancel marker written by the Python script
+        if (Test-Path $CancelMarker) {
+            Remove-Item $CancelMarker -Force
+            $cancelled = $true
+            $jobsCancelled = ($taskNum - 1) * $SelectedPasses.Count + $SelectedPasses.Count
+            $lblStatus.Text = "Render cancelled by user. Stopped after sequence $taskNum / $totalSeqs ($jobsCancelled of $totalJobs jobs)."
+            $form.Refresh()
+            break
+        }
+    }
+
+    if (-not $cancelled) {
+        $lblStatus.Text = "Completed all $totalSeqs sequence(s), $totalJobs job(s)."
+    }
+}
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+$global:FormClosing = $false
+$global:CachedIdentity = $MyIdentity
+$global:IsRendering = $false
+
 # ============================================================
 # MAIN FORM
 # ============================================================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "MRQ Render Launcher"
-$form.Size = New-Object System.Drawing.Size(620, 820)
+$form.Size = New-Object System.Drawing.Size(620, 950)
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $cBack
 $form.ForeColor = $cText
@@ -100,144 +309,47 @@ $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 $form.Font = $fontBody
 
-# Dark title bar
-$form.Add_Shown({
-    $mode = 1
-    [DwmHelper]::DwmSetWindowAttribute($form.Handle, 20, [ref]$mode, 4) | Out-Null
-    $form.Refresh()
-})
-
 $y = 15
 
 # ============================================================
-# TITLE
+# UI LAYOUT - Title
 # ============================================================
-$lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = "MRQ Render Launcher"
-$lblTitle.Font = $fontTitle
-$lblTitle.ForeColor = $cText
-$lblTitle.Location = New-Object System.Drawing.Point(20, $y)
-$lblTitle.Size = New-Object System.Drawing.Size(560, 30)
-$form.Controls.Add($lblTitle)
-
+$lblTitle = New-StyledLabel -Text "MRQ Render Launcher" -Font $fontTitle -ForeColor $cText -X 20 -Y $y -W 560 -H 30 -Parent $form
 $y += 35
 
 # ============================================================
-# PATH CONFIGURATION (always visible, at the top)
+# UI LAYOUT - Path Configuration
 # ============================================================
-$lblConfig = New-Object System.Windows.Forms.Label
-$lblConfig.Text = "PATH CONFIGURATION"
-$lblConfig.Font = $fontSection
-$lblConfig.ForeColor = $cSection
-$lblConfig.Location = New-Object System.Drawing.Point(20, $y)
-$lblConfig.Size = New-Object System.Drawing.Size(300, 20)
-$form.Controls.Add($lblConfig)
+New-SectionHeader -Text "PATH CONFIGURATION" -Y $y -Parent $form | Out-Null
 $y += 24
 
 $configPanel = New-Object System.Windows.Forms.Panel
 $configPanel.Location = New-Object System.Drawing.Point(20, $y)
-$configPanel.Size = New-Object System.Drawing.Size(560, 122)
+$configPanel.Size = New-Object System.Drawing.Size(560, 140)
 $configPanel.BackColor = $cSurface
 $form.Controls.Add($configPanel)
 
-$lblEngine = New-Object System.Windows.Forms.Label
-$lblEngine.Text = "Engine:"
-$lblEngine.Font = $fontSmall
-$lblEngine.ForeColor = $cTextDim
-$lblEngine.Location = New-Object System.Drawing.Point(10, 10)
-$lblEngine.Size = New-Object System.Drawing.Size(55, 18)
-$configPanel.Controls.Add($lblEngine)
+New-StyledLabel -Text "PC ID:" -Font $fontSmall -ForeColor $cTextDim -X 10 -Y 10 -W 100 -H 18 -Parent $configPanel | Out-Null
+$cmbIdentity = New-StyledComboBox -Items @("Local (This PC)", "PC 002", "PC 003", "PC 004") -X 115 -Y 8 -W 435 -Parent $configPanel
+$idx = $cmbIdentity.Items.IndexOf($MyIdentity)
+if ($idx -ge 0) { $cmbIdentity.SelectedIndex = $idx }
 
-$txtEngine = New-Object System.Windows.Forms.TextBox
-$txtEngine.Font = $fontSmall
-$txtEngine.BackColor = $cPanel
-$txtEngine.ForeColor = $cText
-$txtEngine.BorderStyle = 'FixedSingle'
-$txtEngine.Location = New-Object System.Drawing.Point(70, 8)
-$txtEngine.Size = New-Object System.Drawing.Size(480, 22)
-$txtEngine.Text = $EnginePath
-$txtEngine.Add_KeyDown($ctrlAHandler)
-$configPanel.Controls.Add($txtEngine)
+New-StyledLabel -Text "Engine:" -Font $fontSmall -ForeColor $cTextDim -X 10 -Y 42 -W 55 -H 18 -Parent $configPanel | Out-Null
+$txtEngine = New-StyledTextBox -Text $EnginePath -Font $fontSmall -X 70 -Y 40 -W 480 -Parent $configPanel
 
-$lblProject = New-Object System.Windows.Forms.Label
-$lblProject.Text = "Project:"
-$lblProject.Font = $fontSmall
-$lblProject.ForeColor = $cTextDim
-$lblProject.Location = New-Object System.Drawing.Point(10, 42)
-$lblProject.Size = New-Object System.Drawing.Size(55, 18)
-$configPanel.Controls.Add($lblProject)
+New-StyledLabel -Text "Project:" -Font $fontSmall -ForeColor $cTextDim -X 10 -Y 74 -W 55 -H 18 -Parent $configPanel | Out-Null
+$txtProject = New-StyledTextBox -Text $ProjectPath -Font $fontSmall -X 70 -Y 72 -W 480 -Parent $configPanel
 
-$txtProject = New-Object System.Windows.Forms.TextBox
-$txtProject.Font = $fontSmall
-$txtProject.BackColor = $cPanel
-$txtProject.ForeColor = $cText
-$txtProject.BorderStyle = 'FixedSingle'
-$txtProject.Location = New-Object System.Drawing.Point(70, 40)
-$txtProject.Size = New-Object System.Drawing.Size(480, 22)
-$txtProject.Text = $ProjectPath
-$txtProject.Add_KeyDown($ctrlAHandler)
-$configPanel.Controls.Add($txtProject)
+$cbListen = New-StyledCheckBox -Text "Enable Listening Mode (Auto-Render Remote Jobs)" -Font $fontSmall -ForeColor $cText -BackColor $cSurface -X 10 -Y 106 -Checked $MyListen -Parent $configPanel
 
-# Sync Checkbox
-$cbSync = New-Object System.Windows.Forms.CheckBox
-$cbSync.Text = "Update to latest Plastic SCM workspace before rendering"
-$cbSync.Font = $fontSmall
-$cbSync.ForeColor = $cText
-$cbSync.BackColor = $cSurface
-$cbSync.Location = New-Object System.Drawing.Point(10, 72)
-$cbSync.AutoSize = $true
-$cbSync.Checked = $true
-$configPanel.Controls.Add($cbSync)
-
-# Revert Checkbox
-$cbRevert = New-Object System.Windows.Forms.CheckBox
-$cbRevert.Text = "Revert uncommitted local changes before update (Warning: Destructive)"
-$cbRevert.Font = $fontSmall
-$cbRevert.ForeColor = $cTextDim
-$cbRevert.BackColor = $cSurface
-$cbRevert.Location = New-Object System.Drawing.Point(10, 96)
-$cbRevert.AutoSize = $true
-$cbRevert.Checked = $false
-$configPanel.Controls.Add($cbRevert)
-
-$y += 132
+$y += 152
 
 # ============================================================
-# SEQUENCES SECTION
+# UI LAYOUT - Sequences
 # ============================================================
-$lblSeq = New-Object System.Windows.Forms.Label
-$lblSeq.Text = "SEQUENCES"
-$lblSeq.Font = $fontSection
-$lblSeq.ForeColor = $cSection
-$lblSeq.Location = New-Object System.Drawing.Point(20, $y)
-$lblSeq.Size = New-Object System.Drawing.Size(200, 20)
-$form.Controls.Add($lblSeq)
-
-# Select All / Deselect All for Sequences
-$btnSeqAll = New-Object System.Windows.Forms.Button
-$btnSeqAll.Text = "All"
-$btnSeqAll.Font = $fontSmall
-$btnSeqAll.FlatStyle = 'Flat'
-$btnSeqAll.FlatAppearance.BorderSize = 1
-$btnSeqAll.FlatAppearance.BorderColor = $cBorder
-$btnSeqAll.BackColor = $cBtnBg
-$btnSeqAll.ForeColor = $cTextDim
-$btnSeqAll.Size = New-Object System.Drawing.Size(50, 22)
-$btnSeqAll.Location = New-Object System.Drawing.Point(485, $y)
-$form.Controls.Add($btnSeqAll)
-
-$btnSeqNone = New-Object System.Windows.Forms.Button
-$btnSeqNone.Text = "None"
-$btnSeqNone.Font = $fontSmall
-$btnSeqNone.FlatStyle = 'Flat'
-$btnSeqNone.FlatAppearance.BorderSize = 1
-$btnSeqNone.FlatAppearance.BorderColor = $cBorder
-$btnSeqNone.BackColor = $cBtnBg
-$btnSeqNone.ForeColor = $cTextDim
-$btnSeqNone.Size = New-Object System.Drawing.Size(50, 22)
-$btnSeqNone.Location = New-Object System.Drawing.Point(540, $y)
-$form.Controls.Add($btnSeqNone)
-
+New-SectionHeader -Text "SEQUENCES" -Y $y -Parent $form | Out-Null
+$btnSeqAll  = New-SmallButton -Text "All"  -X 485 -Y $y -Parent $form
+$btnSeqNone = New-SmallButton -Text "None" -X 540 -Y $y -Parent $form
 $y += 24
 
 $seqPanel = New-Object System.Windows.Forms.Panel
@@ -262,46 +374,14 @@ foreach ($seq in $Sequences) {
     $sy += 21
 }
 
-$btnSeqAll.Add_Click({ foreach ($cb in $seqCheckboxes) { $cb.Checked = $true } })
-$btnSeqNone.Add_Click({ foreach ($cb in $seqCheckboxes) { $cb.Checked = $false } })
-
 $y += 152
 
 # ============================================================
-# PASSES SECTION (index-based: Pass 1, Pass 2, ...)
+# UI LAYOUT - Passes
 # ============================================================
-$lblPass = New-Object System.Windows.Forms.Label
-$lblPass.Text = "PASSES (Job Index)"
-$lblPass.Font = $fontSection
-$lblPass.ForeColor = $cSection
-$lblPass.Location = New-Object System.Drawing.Point(20, $y)
-$lblPass.Size = New-Object System.Drawing.Size(200, 20)
-$form.Controls.Add($lblPass)
-
-$btnPassAll = New-Object System.Windows.Forms.Button
-$btnPassAll.Text = "All"
-$btnPassAll.Font = $fontSmall
-$btnPassAll.FlatStyle = 'Flat'
-$btnPassAll.FlatAppearance.BorderSize = 1
-$btnPassAll.FlatAppearance.BorderColor = $cBorder
-$btnPassAll.BackColor = $cBtnBg
-$btnPassAll.ForeColor = $cTextDim
-$btnPassAll.Size = New-Object System.Drawing.Size(50, 22)
-$btnPassAll.Location = New-Object System.Drawing.Point(485, $y)
-$form.Controls.Add($btnPassAll)
-
-$btnPassNone = New-Object System.Windows.Forms.Button
-$btnPassNone.Text = "None"
-$btnPassNone.Font = $fontSmall
-$btnPassNone.FlatStyle = 'Flat'
-$btnPassNone.FlatAppearance.BorderSize = 1
-$btnPassNone.FlatAppearance.BorderColor = $cBorder
-$btnPassNone.BackColor = $cBtnBg
-$btnPassNone.ForeColor = $cTextDim
-$btnPassNone.Size = New-Object System.Drawing.Size(50, 22)
-$btnPassNone.Location = New-Object System.Drawing.Point(540, $y)
-$form.Controls.Add($btnPassNone)
-
+New-SectionHeader -Text "PASSES (Job Index)" -Y $y -Parent $form | Out-Null
+$btnPassAll  = New-SmallButton -Text "All"  -X 485 -Y $y -Parent $form
+$btnPassNone = New-SmallButton -Text "None" -X 540 -Y $y -Parent $form
 $y += 24
 
 $passPanel = New-Object System.Windows.Forms.Panel
@@ -327,22 +407,12 @@ for ($i = 1; $i -le $PassCount; $i++) {
     $px += 108
 }
 
-$btnPassAll.Add_Click({ foreach ($cb in $passCheckboxes) { $cb.Checked = $true } })
-$btnPassNone.Add_Click({ foreach ($cb in $passCheckboxes) { $cb.Checked = $false } })
-
 $y += 48
 
 # ============================================================
-# RENDER SETTINGS SECTION
+# UI LAYOUT - Render Settings
 # ============================================================
-$lblSettings = New-Object System.Windows.Forms.Label
-$lblSettings.Text = "RENDER SETTINGS"
-$lblSettings.Font = $fontSection
-$lblSettings.ForeColor = $cSection
-$lblSettings.Location = New-Object System.Drawing.Point(20, $y)
-$lblSettings.Size = New-Object System.Drawing.Size(300, 20)
-$form.Controls.Add($lblSettings)
-
+New-SectionHeader -Text "RENDER SETTINGS" -Y $y -Parent $form | Out-Null
 $y += 24
 
 $settingsPanel = New-Object System.Windows.Forms.Panel
@@ -351,134 +421,45 @@ $settingsPanel.Size = New-Object System.Drawing.Size(560, 190)
 $settingsPanel.BackColor = $cSurface
 $form.Controls.Add($settingsPanel)
 
-# Resolution
-$lblRes = New-Object System.Windows.Forms.Label
-$lblRes.Text = "Resolution:"
-$lblRes.Font = $fontBody
-$lblRes.ForeColor = $cTextDim
-$lblRes.Location = New-Object System.Drawing.Point(15, 15)
-$lblRes.Size = New-Object System.Drawing.Size(130, 20)
-$settingsPanel.Controls.Add($lblRes)
+New-StyledLabel -Text "Resolution:" -Font $fontBody -ForeColor $cTextDim -X 15 -Y 15 -W 130 -H 20 -Parent $settingsPanel | Out-Null
+$cmbRes = New-StyledComboBox -Items @("Half Res  (4968 x 1296)  -  Default", "Full Res  (9936 x 2592)", "Quarter Res  (2484 x 648)") -X 150 -Y 12 -W 390 -Parent $settingsPanel
 
-$cmbRes = New-Object System.Windows.Forms.ComboBox
-$cmbRes.Font = $fontBody
-$cmbRes.BackColor = $cPanel
-$cmbRes.ForeColor = $cText
-$cmbRes.FlatStyle = 'Flat'
-$cmbRes.DropDownStyle = 'DropDownList'
-$cmbRes.Location = New-Object System.Drawing.Point(150, 12)
-$cmbRes.Size = New-Object System.Drawing.Size(390, 24)
-$cmbRes.Items.AddRange(@(
-    "Half Res  (4968 x 1296)  -  Default",
-    "Full Res  (9936 x 2592)",
-    "Quarter Res  (2484 x 648)"
-))
-$cmbRes.SelectedIndex = 0
-$settingsPanel.Controls.Add($cmbRes)
+New-StyledLabel -Text "Spatial Samples:" -Font $fontBody -ForeColor $cTextDim -X 15 -Y 50 -W 130 -H 20 -Parent $settingsPanel | Out-Null
+$txtSpatial = New-StyledTextBox -Text "1" -Font $fontBody -X 150 -Y 48 -W 80 -Parent $settingsPanel
+New-StyledLabel -Text "Default: 1" -Font $fontSmall -ForeColor $cTextDim -X 240 -Y 50 -W 200 -H 18 -Parent $settingsPanel | Out-Null
 
-# Spatial Sample Count
-$lblSpatial = New-Object System.Windows.Forms.Label
-$lblSpatial.Text = "Spatial Samples:"
-$lblSpatial.Font = $fontBody
-$lblSpatial.ForeColor = $cTextDim
-$lblSpatial.Location = New-Object System.Drawing.Point(15, 50)
-$lblSpatial.Size = New-Object System.Drawing.Size(130, 20)
-$settingsPanel.Controls.Add($lblSpatial)
+New-StyledLabel -Text "Temporal Samples:" -Font $fontBody -ForeColor $cTextDim -X 15 -Y 85 -W 130 -H 20 -Parent $settingsPanel | Out-Null
+$txtTemporal = New-StyledTextBox -Text "1" -Font $fontBody -X 150 -Y 83 -W 80 -Parent $settingsPanel
+New-StyledLabel -Text "Default: 1" -Font $fontSmall -ForeColor $cTextDim -X 240 -Y 85 -W 200 -H 18 -Parent $settingsPanel | Out-Null
 
-$txtSpatial = New-Object System.Windows.Forms.TextBox
-$txtSpatial.Font = $fontBody
-$txtSpatial.BackColor = $cPanel
-$txtSpatial.ForeColor = $cText
-$txtSpatial.BorderStyle = 'FixedSingle'
-$txtSpatial.Location = New-Object System.Drawing.Point(150, 48)
-$txtSpatial.Size = New-Object System.Drawing.Size(80, 22)
-$txtSpatial.Text = "1"
-$txtSpatial.Add_KeyDown($ctrlAHandler)
-$settingsPanel.Controls.Add($txtSpatial)
+New-StyledLabel -Text "Warm-Up Frames:" -Font $fontBody -ForeColor $cTextDim -X 15 -Y 120 -W 130 -H 20 -Parent $settingsPanel | Out-Null
+$txtWarmup = New-StyledTextBox -Text "32" -Font $fontBody -X 150 -Y 118 -W 80 -Parent $settingsPanel
+New-StyledLabel -Text "Default: 32" -Font $fontSmall -ForeColor $cTextDim -X 240 -Y 120 -W 200 -H 18 -Parent $settingsPanel | Out-Null
 
-$lblSpatialHint = New-Object System.Windows.Forms.Label
-$lblSpatialHint.Text = "Default: 1"
-$lblSpatialHint.Font = $fontSmall
-$lblSpatialHint.ForeColor = $cTextDim
-$lblSpatialHint.Location = New-Object System.Drawing.Point(240, 50)
-$lblSpatialHint.Size = New-Object System.Drawing.Size(200, 18)
-$settingsPanel.Controls.Add($lblSpatialHint)
-
-# Temporal Sample Count
-$lblTemporal = New-Object System.Windows.Forms.Label
-$lblTemporal.Text = "Temporal Samples:"
-$lblTemporal.Font = $fontBody
-$lblTemporal.ForeColor = $cTextDim
-$lblTemporal.Location = New-Object System.Drawing.Point(15, 85)
-$lblTemporal.Size = New-Object System.Drawing.Size(130, 20)
-$settingsPanel.Controls.Add($lblTemporal)
-
-$txtTemporal = New-Object System.Windows.Forms.TextBox
-$txtTemporal.Font = $fontBody
-$txtTemporal.BackColor = $cPanel
-$txtTemporal.ForeColor = $cText
-$txtTemporal.BorderStyle = 'FixedSingle'
-$txtTemporal.Location = New-Object System.Drawing.Point(150, 83)
-$txtTemporal.Size = New-Object System.Drawing.Size(80, 22)
-$txtTemporal.Text = "1"
-$txtTemporal.Add_KeyDown($ctrlAHandler)
-$settingsPanel.Controls.Add($txtTemporal)
-
-$lblTemporalHint = New-Object System.Windows.Forms.Label
-$lblTemporalHint.Text = "Default: 1"
-$lblTemporalHint.Font = $fontSmall
-$lblTemporalHint.ForeColor = $cTextDim
-$lblTemporalHint.Location = New-Object System.Drawing.Point(240, 85)
-$lblTemporalHint.Size = New-Object System.Drawing.Size(200, 18)
-$settingsPanel.Controls.Add($lblTemporalHint)
-
-# Warm-Up Frames
-$lblWarmup = New-Object System.Windows.Forms.Label
-$lblWarmup.Text = "Warm-Up Frames:"
-$lblWarmup.Font = $fontBody
-$lblWarmup.ForeColor = $cTextDim
-$lblWarmup.Location = New-Object System.Drawing.Point(15, 120)
-$lblWarmup.Size = New-Object System.Drawing.Size(130, 20)
-$settingsPanel.Controls.Add($lblWarmup)
-
-$txtWarmup = New-Object System.Windows.Forms.TextBox
-$txtWarmup.Font = $fontBody
-$txtWarmup.BackColor = $cPanel
-$txtWarmup.ForeColor = $cText
-$txtWarmup.BorderStyle = 'FixedSingle'
-$txtWarmup.Location = New-Object System.Drawing.Point(150, 118)
-$txtWarmup.Size = New-Object System.Drawing.Size(80, 22)
-$txtWarmup.Text = "32"
-$txtWarmup.Add_KeyDown($ctrlAHandler)
-$settingsPanel.Controls.Add($txtWarmup)
-
-$lblWarmupHint = New-Object System.Windows.Forms.Label
-$lblWarmupHint.Text = "Default: 32"
-$lblWarmupHint.Font = $fontSmall
-$lblWarmupHint.ForeColor = $cTextDim
-$lblWarmupHint.Location = New-Object System.Drawing.Point(240, 120)
-$lblWarmupHint.Size = New-Object System.Drawing.Size(200, 18)
-$settingsPanel.Controls.Add($lblWarmupHint)
-
-# No Sound checkbox
-$cbNoSound = New-Object System.Windows.Forms.CheckBox
-$cbNoSound.Text = "  No Sound  (disable audio - required for silent headless renders, disables WAV export)"
-$cbNoSound.Font = $fontSmall
-$cbNoSound.ForeColor = $cText
-$cbNoSound.BackColor = $cSurface
-$cbNoSound.Location = New-Object System.Drawing.Point(12, 155)
-$cbNoSound.AutoSize = $true
-$cbNoSound.Checked = $true
-$settingsPanel.Controls.Add($cbNoSound)
+$cbNoSound = New-StyledCheckBox -Text "  No Sound  (disable audio - required for silent headless renders, disables WAV export)" -Font $fontSmall -ForeColor $cText -BackColor $cSurface -X 12 -Y 155 -Checked $true -Parent $settingsPanel
 
 $y += 200
 
 # ============================================================
-# BOTTOM BUTTONS
+# UI LAYOUT - Dispatch Options
 # ============================================================
 $y += 10
 
-# Status label
+$cbSync   = New-StyledCheckBox -Text "Update to latest Plastic SCM workspace before rendering" -Font $fontSmall -ForeColor $cText -BackColor $cBack -X 20 -Y $y -Checked $true -Parent $form
+$y += 24
+
+$cbRevert = New-StyledCheckBox -Text "Revert uncommitted local changes before update (Warning: Destructive)" -Font $fontSmall -ForeColor $cTextDim -BackColor $cBack -X 20 -Y $y -Checked $false -Parent $form
+$y += 30
+
+New-StyledLabel -Text "TARGET PC:" -Font $fontSmall -ForeColor $cTextDim -X 20 -Y ($y + 2) -W 100 -H 18 -Parent $form | Out-Null
+$cmbTarget = New-StyledComboBox -Items @("Local (This PC)", "PC 002", "PC 003", "PC 004") -X 125 -Y $y -W 455 -Parent $form
+$y += 40
+
+# ============================================================
+# UI LAYOUT - Bottom Buttons
+# ============================================================
+$y += 10
+
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Text = ""
 $lblStatus.Font = $fontSmall
@@ -490,7 +471,6 @@ $form.Controls.Add($lblStatus)
 
 $y += 22
 
-# Open Render Output Folder button
 $btnOpenFolder = New-Object System.Windows.Forms.Button
 $btnOpenFolder.Text = "Output Folder"
 $btnOpenFolder.Font = $fontBtn
@@ -504,20 +484,6 @@ $btnOpenFolder.Location = New-Object System.Drawing.Point(20, $y)
 $btnOpenFolder.Cursor = [System.Windows.Forms.Cursors]::Hand
 $form.Controls.Add($btnOpenFolder)
 
-$btnOpenFolder.Add_Click({
-    # Derive the project root from the .uproject path
-    $projDir = Split-Path -Parent $txtProject.Text
-    $renderDir = Join-Path $projDir "Saved\MovieRenders"
-    if (Test-Path $renderDir) {
-        Start-Process "explorer.exe" $renderDir
-    } else {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Render output folder not found:`n$renderDir`n`nIt will be created after the first render.",
-            "Folder Not Found", 'OK', 'Information')
-    }
-})
-
-# LAUNCH RENDER button
 $btnLaunch = New-Object System.Windows.Forms.Button
 $btnLaunch.Text = "Launch Render"
 $btnLaunch.Font = $fontBtn
@@ -531,27 +497,100 @@ $btnLaunch.Cursor = [System.Windows.Forms.Cursors]::Hand
 $form.Controls.Add($btnLaunch)
 
 # ============================================================
-# LAUNCH LOGIC
+# LISTENER TIMER
 # ============================================================
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 30000 # 30 seconds
+
+# ============================================================
+# EVENT HANDLERS
+# All event wiring is grouped here, after every control exists.
+# ============================================================
+
+# --- Form Events ---
+$form.Add_Shown({
+    $mode = 1
+    [DwmHelper]::DwmSetWindowAttribute($form.Handle, 20, [ref]$mode, 4) | Out-Null
+    $form.Refresh()
+    # Auto-start timer if Listen Mode was saved as enabled
+    if ($cbListen.Checked -and $global:CachedIdentity -ne "Local (This PC)") {
+        $timer.Start()
+        $lblStatus.Text = "Listening Mode enabled. Polling every 30s..."
+    }
+})
+
+$form.Add_FormClosing({
+    $global:FormClosing = $true
+    $timer.Stop()
+})
+
+# --- Dropdown flicker prevention ---
+# Pausing the timer while any ComboBox is open prevents the tick
+# handler from interfering with the dropdown popup on the UI thread.
+$cmbIdentity.Add_DropDown({ $timer.Stop() })
+$cmbIdentity.Add_DropDownClosed({ if ($cbListen.Checked) { $timer.Start() } })
+$cmbRes.Add_DropDown({ $timer.Stop() })
+$cmbRes.Add_DropDownClosed({ if ($cbListen.Checked) { $timer.Start() } })
+$cmbTarget.Add_DropDown({ $timer.Stop() })
+$cmbTarget.Add_DropDownClosed({ if ($cbListen.Checked) { $timer.Start() } })
+
+# --- Config auto-save on PC ID change ---
+$cmbIdentity.Add_SelectedIndexChanged({
+    $global:CachedIdentity = $cmbIdentity.SelectedItem.ToString()
+    Save-RenderConfig
+})
+
+# --- Listen Mode toggle ---
+$cbListen.Add_CheckedChanged({
+    Save-RenderConfig
+    if ($cbListen.Checked -and $cmbIdentity.SelectedItem.ToString() -ne "Local (This PC)") {
+        $timer.Start()
+        $lblStatus.Text = "Listening Mode enabled. Polling every 30s..."
+    } else {
+        $timer.Stop()
+        if (-not $cbListen.Checked) { $lblStatus.Text = "" }
+    }
+})
+
+# --- Select All / Deselect All ---
+$btnSeqAll.Add_Click({ foreach ($cb in $seqCheckboxes) { $cb.Checked = $true } })
+$btnSeqNone.Add_Click({ foreach ($cb in $seqCheckboxes) { $cb.Checked = $false } })
+$btnPassAll.Add_Click({ foreach ($cb in $passCheckboxes) { $cb.Checked = $true } })
+$btnPassNone.Add_Click({ foreach ($cb in $passCheckboxes) { $cb.Checked = $false } })
+
+# --- Output Folder button ---
+$btnOpenFolder.Add_Click({
+    $projDir = Split-Path -Parent $txtProject.Text
+    $renderDir = Join-Path $projDir "Saved\MovieRenders"
+    if (Test-Path $renderDir) {
+        Start-Process "explorer.exe" $renderDir
+    } else {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Render output folder not found:`n$renderDir`n`nIt will be created after the first render.",
+            "Folder Not Found", 'OK', 'Information')
+    }
+})
+
+# --- Launch Render button ---
 $btnLaunch.Add_Click({
+    $global:IsRendering = $true
+
     # Validate selection
     $selectedSeqs = $seqCheckboxes | Where-Object { $_.Checked }
     $selectedPasses = $passCheckboxes | Where-Object { $_.Checked }
-    
+
     if ($selectedSeqs.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Please select at least one sequence.", "No Sequences Selected", 'OK', 'Warning')
+        $global:IsRendering = $false
         return
     }
     if ($selectedPasses.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Please select at least one pass.", "No Passes Selected", 'OK', 'Warning')
+        $global:IsRendering = $false
         return
     }
 
-    # Save config
-    $engineVal = $txtEngine.Text
-    $projectVal = $txtProject.Text
-    "set ENGINE=`"$engineVal`"" | Out-File -FilePath $ConfigFile -Encoding ascii
-    "set PROJECT=`"$projectVal`"" | Out-File -FilePath $ConfigFile -Encoding ascii -Append
+    Save-RenderConfig
 
     # Resolution mapping
     switch ($cmbRes.SelectedIndex) {
@@ -560,13 +599,10 @@ $btnLaunch.Add_Click({
         2 { $resX = "2484"; $resY = "648" }
     }
 
-    # Build base args
+    # Build command arguments
     $baseArgs = "-log -notexturestreaming -unattended"
-    if ($cbNoSound.Checked) {
-        $baseArgs += " -nosound"
-    }
-    
-    # Build override args
+    if ($cbNoSound.Checked) { $baseArgs += " -nosound" }
+
     $overrideArgs = "-RenderResX=$resX -RenderResY=$resY"
     if ($txtSpatial.Text.Trim() -ne "") { $overrideArgs += " -Spatial=$($txtSpatial.Text.Trim())" }
     if ($txtTemporal.Text.Trim() -ne "") { $overrideArgs += " -Temporal=$($txtTemporal.Text.Trim())" }
@@ -580,79 +616,102 @@ $btnLaunch.Add_Click({
         $jobIndicesArg = "-JobIndices=$indices"
     }
 
-    # Count totals: one Unreal launch per sequence, total jobs = sequences x passes
     $totalSeqs = $selectedSeqs.Count
     $totalJobs = $selectedSeqs.Count * $selectedPasses.Count
-
-    # Log what we're about to do
     $seqList = ($selectedSeqs | ForEach-Object { $_.Tag.Code }) -join ", "
     $passList = if ($allPassesSelected) { "ALL" } else { ($selectedPasses | ForEach-Object { "Pass $($_.Tag)" }) -join ", " }
 
     # Clean up any stale cancel marker
     if (Test-Path $CancelMarker) { Remove-Item $CancelMarker -Force }
 
-    # Sync Plastic SCM
+    # Optional Plastic SCM sync
     if ($cbSync.Checked) {
-        $lblStatus.Text = "Syncing latest changes from Plastic SCM..."
-        $form.Refresh()
-        
-        $projDir = Split-Path -Parent $projectVal
-        Push-Location -Path $projDir
-        try {
-            if ($cbRevert.Checked) {
-                $lblStatus.Text = "Reverting local changes in Plastic SCM..."
-                $form.Refresh()
-                & "cm" undo . -R
-            }
-            $lblStatus.Text = "Syncing latest changes from Plastic SCM..."
-            $form.Refresh()
-            & "cm" update
-        } catch {
-            Write-Host "Plastic SCM sync failed or 'cm' not found. Continuing..."
-        }
-        Pop-Location
+        Sync-PlasticSCM -ProjectPath $txtProject.Text -ShouldRevert $cbRevert.Checked
     }
 
     $lblStatus.Text = "Starting $totalSeqs sequence(s), $totalJobs total job(s): Seq[$seqList] Pass[$passList] @ ${resX}x${resY}"
     $form.Refresh()
 
-    $cancelled = $false
-    $taskNum = 0
-    foreach ($seqCb in $selectedSeqs) {
-        if ($cancelled) { break }
+    $targetName = $cmbTarget.SelectedItem.ToString()
+    if ($targetName -ne "Local (This PC)") {
+        Submit-RemoteJobs -TargetName $targetName -SelectedSeqs $selectedSeqs -BaseArgs $baseArgs -OverrideArgs $overrideArgs -JobIndicesArg $jobIndicesArg
+    } else {
+        Invoke-LocalRender -SelectedSeqs $selectedSeqs -SelectedPasses $selectedPasses -EnginePath $txtEngine.Text -ProjectPath $txtProject.Text -BaseArgs $baseArgs -OverrideArgs $overrideArgs -JobIndicesArg $jobIndicesArg -PassList $passList
+    }
 
-        $seq = $seqCb.Tag
-        $queue = $seq.Queue
+    $global:IsRendering = $false
+})
 
-        $taskNum++
-        $jobsDone = ($taskNum - 1) * $selectedPasses.Count
-        $jobsInThis = $selectedPasses.Count
-        $lblStatus.Text = "Sequence $taskNum / $totalSeqs : $($seq.Name) - $passList ($jobsDone of $totalJobs jobs done)..."
+# --- Listener Timer Tick ---
+$timer.Add_Tick({
+    if ($global:IsRendering) { return }
+    if (-not $cbListen.Checked) { return }
+    $identity = $global:CachedIdentity
+    if ($identity -eq "Local (This PC)") { return }
+
+    # Sync workspace to pull any new Jobs
+    # cm update is workspace-wide (no subfolder path arg) - it detects the workspace from cwd
+    $lblStatus.Text = "Listening: Polling Plastic SCM..."
+    $form.Refresh()
+    Push-Location -Path $ScriptDir
+    try { & "cm" update } catch {}
+    Pop-Location
+
+    $jobsDir = Join-Path $ScriptDir "Jobs"
+    if (-not (Test-Path $jobsDir)) { return }
+
+    $pendingJobs = Get-ChildItem -Path $jobsDir -Filter "${identity}_*.json" | Sort-Object CreationTime
+    if ($pendingJobs.Count -gt 0) {
+        $jobFile = $pendingJobs[0].FullName
+
+        # Check human activity
+        $uiOpen = Get-Process "UnrealEditor" -ErrorAction SilentlyContinue
+        if ($uiOpen) { return }
+
+        $global:IsRendering = $true
+        $lblStatus.Text = "Listening Mode: Found remote job. Syncing heavy project..."
         $form.Refresh()
 
-        $cmdArgs = "`"$projectVal`" $baseArgs -ExecutePythonScript=`"$PythonScript`" -Queue=`"$queue`" $overrideArgs $jobIndicesArg"
+        # Parse job
+        $jobData = Get-Content -Path $jobFile -Raw | ConvertFrom-Json
+        $projectVal = $txtProject.Text
+        $engineVal = $txtEngine.Text
+
+        # Claim job immediately: remove from Plastic SCM before rendering.
+        # This prevents re-execution if this PC crashes or another PC picks it up.
+        $lblStatus.Text = "Listening Mode: Claiming job $($jobData.SequenceName)..."
+        $form.Refresh()
+        Push-Location -Path $ScriptDir
+        try {
+            & "cm" remove "$jobFile"
+            & "cm" checkin "$jobsDir" -m "Claimed render job for $($jobData.SequenceName)"
+        } catch {}
+        Pop-Location
+
+        # Sync the heavy Unreal project before rendering
+        $projDir = Split-Path -Parent $projectVal
+        Push-Location -Path $projDir
+        try { & "cm" update } catch {}
+        Pop-Location
+
+        $lblStatus.Text = "Listening Mode: Executing remote job $($jobData.SequenceName)..."
+        $form.Refresh()
+
+        $cmdArgs = "`"$projectVal`" $($jobData.BaseArgs) -ExecutePythonScript=`"$PythonScript`" -Queue=`"$($jobData.Queue)`" $($jobData.OverrideArgs) $($jobData.JobIndicesArg)"
         $process = Start-Process -FilePath $engineVal -ArgumentList $cmdArgs -PassThru
 
-        # Non-blocking wait: keep the GUI responsive via DoEvents()
         while (-not $process.HasExited) {
             [System.Windows.Forms.Application]::DoEvents()
+            if ($global:FormClosing) { break }
+            $lblStatus.Text = "Listening Mode: Waiting for Unreal (PID: $($process.Id)) to fully close..."
             Start-Sleep -Milliseconds 500
         }
 
-        # Check for cancel marker written by the Python script
-        if (Test-Path $CancelMarker) {
-            Remove-Item $CancelMarker -Force
-            $cancelled = $true
-            $jobsCancelled = ($taskNum - 1) * $selectedPasses.Count + $selectedPasses.Count
-            $lblStatus.Text = "Render cancelled by user. Stopped after sequence $taskNum / $totalSeqs ($jobsCancelled of $totalJobs jobs)."
-            $form.Refresh()
-            break
-        }
-    }
 
-    # Done
-    if (-not $cancelled) {
-        $lblStatus.Text = "Completed all $totalSeqs sequence(s), $totalJobs job(s)."
+        $lblStatus.Text = "Listening Mode: Finished remote job. Waiting for next..."
+        $global:IsRendering = $false
+    } else {
+        $lblStatus.Text = "Listening: No pending jobs. Last check $(Get-Date -Format 'HH:mm:ss')"
     }
 })
 
